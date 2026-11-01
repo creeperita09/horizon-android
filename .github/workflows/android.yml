@@ -67,11 +67,22 @@ jobs:
       - name: Install the Android SDK and NDK
         uses: android-actions/setup-android@v3
         with:
+          cmdline-tools-version: latest
           packages: >-
             platform-tools
-            platforms;android-37
             build-tools;36.0.0
             ndk;${{ env.ANDROID_NDK_VERSION }}
+      # compileSdk 37 (android/app/build.gradle). The package's name differs between sdkmanager versions (android-37
+      # or android-37.0), so try both, and let Gradle download the platform itself if neither is known.
+      - name: Install the Android platform the app compiles against
+        run: |
+          for pkg in "platforms;android-37.0" "platforms;android-37"; do
+            if sdkmanager --install "$pkg" >/dev/null 2>&1; then
+              echo "Installed $pkg"
+              exit 0
+            fi
+          done
+          echo "sdkmanager knows neither name; Gradle will fetch the platform"
       - name: Install Rust with the Android target
         run: rustup toolchain install stable --profile minimal --target aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
