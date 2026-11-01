@@ -92,10 +92,19 @@ jobs:
             android/java-launcher -> target
           shared-key: android-${{ inputs.profile || 'android' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The repo's .gitignore excludes *.jar, so android/gradle/wrapper/gradle-wrapper.jar is never in a checkout: install
+      # Gradle, then have it write the wrapper jar for the version android/gradle/wrapper/gradle-wrapper.properties pins.
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: wrapper
-          build-root-directory: android
+          gradle-version: '8.14.5'
+      - name: Create the Gradle wrapper jar
+        run: |
+          version=$(sed -n 's#.*gradle-\(.*\)-bin\.zip#\1#p' android/gradle/wrapper/gradle-wrapper.properties)
+          echo "Wrapper version: $version"
+          gradle --no-daemon -p android wrapper --gradle-version "$version"
+          # Keep the repo's own gradlew and properties; only the (ignored) jar is new.
+          git checkout -- android/gradlew android/gradle/wrapper/gradle-wrapper.properties
+          test -f android/gradle/wrapper/gradle-wrapper.jar
       - name: Decode the signing key
         if: env.KEYSTORE_B64 != ''
         env:
