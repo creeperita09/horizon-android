@@ -597,6 +597,12 @@ fn sprite_split() -> u32 {
         .filter(|&n| (1..=SPRITE_SPLIT).contains(&n))
         .unwrap_or(SPRITE_SPLIT)
 }
+/// The layers per sprite array on a device with `limits`: [`sprite_split`], or
+/// fewer where the GPU's `max_texture_array_layers` is lower (some Android GPUs
+/// stop at 1024), the sprites going into more arrays.
+fn device_split(limits: &wgpu::Limits) -> u32 {
+    sprite_split().min(limits.max_texture_array_layers).max(1)
+}
 /// Sprite arrays terrain.wgsl binds (`sprites`, `sprites_1`...).
 const SPRITE_ARRAYS: u32 = 8;
 /// The layers to give a square texture of `count` layers viewed as a 2D
@@ -678,6 +684,8 @@ fn terrain_group(
 pub struct PreparedTextures {
     sprites: Vec<(Vec<u8>, u32)>,
     forcefield: (Vec<u8>, u32),
+    /// The layers per array in `sprites`.
+    split: u32,
 }
 impl PreparedTextures {
     pub fn new(
@@ -709,7 +717,36 @@ impl PreparedTextures {
                 })
                 .collect(),
             forcefield: mip_chain(forcefield.0, forcefield.1, &[], 0, 1),
+            split,
         }
+    }
+
+    /// The same mip chains in arrays of `split` layers, for a GPU whose texture
+    /// arrays are shorter than the ones they were prepared for (the resource
+    /// worker prepares them before a device is open). Layers are only moved,
+    /// not generated again.
+    fn resplit(mut self, layers: u32, split: u32) -> Self {
+        if self.split == split || layers == 0 {
+            return self;
+        }
+        let levels = self.sprites[0].1;
+        let first = layers.clamp(1, self.split);
+        let chain_bytes = self.sprites[0].0.len() / first as usize;
+        let mut all = Vec::with_capacity(chain_bytes * layers as usize);
+        for (bytes, _) in self.sprites.drain(..) {
+            all.extend_from_slice(&bytes);
+        }
+        self.sprites = (0..layers.div_ceil(split).max(1))
+            .map(|array| {
+                let first = array * split;
+                let count = layers.saturating_sub(first).clamp(1, split);
+                let start = first as usize * chain_bytes;
+                let end = start + count as usize * chain_bytes;
+                (all[start..end].to_vec(), levels)
+            })
+            .collect();
+        self.split = split;
+        self
     }
 }
 
@@ -840,13 +877,14 @@ fn describe_adapter(adapter: &wgpu::Adapter) {
         ),
     );
 }
-/// Whether an adapter's texture arrays hold the block textures Horizon puts
-/// in one array.
+/// Whether the arrays an adapter allows, [`SPRITE_ARRAYS`] of them, hold the
+/// block textures.
 fn check_layers(limits: &wgpu::Limits, layers: u32) -> Result<()> {
-    let needed = layers.min(sprite_split());
-    if limits.max_texture_array_layers < needed {
+    let most = device_split(limits) * SPRITE_ARRAYS;
+    if layers > most {
         return Err(format!(
-            "GPU supports {} texture layers; {needed} required",
+            "GPU supports {} texture layers per array, which fits {most} block textures; \
+             {layers} required",
             limits.max_texture_array_layers
         )
         .into());
@@ -1054,14 +1092,6 @@ impl Renderer {
         previous: Option<&Self>,
         api: GraphicsApi,
     ) -> Result<Self> {
-        let split = sprite_split();
-        if layers > split * SPRITE_ARRAYS {
-            return Err(format!(
-                "{layers} block textures; Horizon draws at most {}",
-                split * SPRITE_ARRAYS
-            )
-            .into());
-        }
         let Opened {
             instance,
             surface,
@@ -1097,6 +1127,8 @@ impl Renderer {
             }
             None => open_device(&window, offscreen, api, layers).await?,
         };
+        // Fewer layers per array where the GPU's arrays are shorter than 2048.
+        let split = device_split(&adapter.limits());
         let info = adapter.get_info();
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
         let size = window.inner_size();
@@ -1433,9 +1465,17 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let prepared = prepared.unwrap_or_else(|| {
-            PreparedTextures::new(sprite_pixels, sprite_size, layers, sprite_mips, forcefield)
-        });
+        let prepared = match prepared {
+            Some(prepared) => prepared.resplit(layers, split),
+            None => PreparedTextures::with_split(
+                sprite_pixels,
+                sprite_size,
+                layers,
+                sprite_mips,
+                forcefield,
+                split,
+            ),
+        };
         let mut mip_levels = 1;
         let gl = adapter.get_info().backend == wgpu::Backend::Gl;
         let sprite_textures: Vec<wgpu::Texture> = prepared
@@ -3358,7 +3398,7 @@ impl Renderer {
                 &self.device,
                 &mut encoder,
                 &self.sprite_textures,
-                sprite_split(),
+                device_split(&self.device.limits()),
                 layers,
                 self.sprite_textures[0].width(),
             );
@@ -5862,6 +5902,41 @@ mod sprite_upload_tests {
             assert_eq!(actual, expected.0);
             assert_eq!(prepared.forcefield, mip_chain(&border, size, &[], 0, 1));
         }
+    }
+
+    #[test]
+    fn resplitting_prepared_textures_matches_preparing_at_that_split() {
+        let size = 4;
+        let layers = 11;
+        let pixels: Vec<u8> = (0..size * size * layers)
+            .flat_map(|i| [i as u8, (i * 5) as u8, 7, if i % 4 == 0 { 0 } else { 255 }])
+            .collect();
+        let border = [20, 30, 40, 128].repeat(16);
+        let prepare = |split| {
+            PreparedTextures::with_split(&pixels, size, layers, &[], (&border, size), split)
+        };
+        // From a GPU-sized split down to shorter arrays, and back up to one.
+        for (from, to) in [(16, 4), (16, 5), (4, 16), (5, 3), (3, 3), (16, 1)] {
+            let resplit = prepare(from).resplit(layers, to);
+            let direct = prepare(to);
+            assert_eq!(resplit.split, to);
+            assert_eq!(resplit.sprites, direct.sprites, "{from} -> {to}");
+            assert_eq!(resplit.forcefield, direct.forcefield);
+        }
+    }
+
+    #[test]
+    fn shorter_texture_arrays_still_fit_the_block_textures() {
+        let limits = |layers| wgpu::Limits {
+            max_texture_array_layers: layers,
+            ..wgpu::Limits::default()
+        };
+        // A GPU with 1024 layers holds vanilla's 1291 block textures in two arrays.
+        assert_eq!(device_split(&limits(1024)), 1024.min(sprite_split()));
+        assert!(check_layers(&limits(1024), 1291).is_ok());
+        assert!(check_layers(&limits(256), 1291).is_ok());
+        assert!(check_layers(&limits(128), 1291).is_err());
+        assert!(check_layers(&limits(2048), 1291).is_ok());
     }
 
     #[test]

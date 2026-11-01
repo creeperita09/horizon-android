@@ -1,0 +1,119 @@
+name: android apk
+run-name: android apk${{ inputs.publish && ' (publish)' || '' }}
+# Builds the Android app (android/build.sh) on GitHub's Ubuntu runner and uploads the APK as a workflow artifact.
+#   gh workflow run "android apk"                            # a quick APK (no LTO), as an artifact
+#   gh workflow run "android apk" -f profile=release         # the shipping build (thin LTO, slower)
+#   gh workflow run "android apk" -f publish=true            # also publish it as the android-<code> release the
+#                                                            # app's updater reads (android/release.sh)
+# It runs by itself for pushes to main that change the app, the game's crates or this file.
+#
+# Signing: with no secrets the APK is signed with Gradle's debug key, which installs fine but cannot update over an
+# APK signed with another key. To keep one key, add these repository secrets:
+#   ANDROID_KEYSTORE_BASE64    the keystore file, base64 encoded (base64 -w0 release.jks)
+#   ANDROID_KEYSTORE_PASSWORD  its password
+#   ANDROID_KEY_ALIAS          the key's alias
+# Minecraft's files are never part of the APK: the app prepares them on the phone from the player's own copy.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'research-lock.json'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Cargo profile: android (no LTO, quick) or release (thin LTO, slow)'
+        type: choice
+        options: [android, release]
+        default: android
+      publish:
+        description: 'Publish the APK as a GitHub release (android/release.sh)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  # Test and build runs never reach the telemetry server (docs/telemetry.md).
+  HORIZON_TELEMETRY_URL: "off"
+  ANDROID_NDK_VERSION: 28.2.13676358
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Write access is only used by the publish step (a manual run with publish on); nothing here runs pull requests' code.
+    permissions:
+      contents: write
+    env:
+      KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the host tools build.sh uses
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm xz-utils zip python3 \
+            libasound2-dev libudev-dev
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install the Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-37
+            build-tools;36.0.0
+            ndk;${{ env.ANDROID_NDK_VERSION }}
+      - name: Install Rust with the Android target
+        run: rustup toolchain install stable --profile minimal --target aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            android/java-launcher -> target
+          shared-key: android-${{ inputs.profile || 'android' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          build-root-directory: android
+      - name: Decode the signing key
+        if: env.KEYSTORE_B64 != ''
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/horizon.jks"
+          {
+            echo "HORIZON_ANDROID_KEYSTORE=$RUNNER_TEMP/horizon.jks"
+            echo "HORIZON_ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "HORIZON_ANDROID_KEY_ALIAS=$KEY_ALIAS"
+          } >> "$GITHUB_ENV"
+      - name: Build the APK
+        env:
+          HORIZON_ANDROID_PROFILE: ${{ inputs.profile || 'android' }}
+          HORIZON_ANDROID_JOBS: '4'
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          android/build.sh
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-android-apk
+          path: android/build/horizon-*-android-arm64.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish the release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HORIZON_ANDROID_REPO: ${{ github.repository }}
+        run: android/release.sh
